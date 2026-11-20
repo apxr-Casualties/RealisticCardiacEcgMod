@@ -1,0 +1,27 @@
+# Build outputs
+**/bin/
+**/obj/
+*.user
+*.suo
+*.cache
+.vs/
+.vscode/
+.idea/
+Directory.Build.props
+
+# Game binaries, third-party dependencies & tools (must NOT be redistributed)
+Managed/
+BepInEx/
+CUCoreLib-main/
+dnSpy-net-win64/
+AssetRipper_export_游戏原版资源/
+
+# Local test logs & media assets
+测试日志/
+素材/
+*.mp4
+*.log
+*.dll
+*.exe
+*.pdb
+*.mdb
