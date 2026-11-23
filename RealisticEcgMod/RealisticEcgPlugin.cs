@@ -13,18 +13,36 @@ namespace RealisticEcgMod
     {
         public const string PluginGuid = "com.casualties.realistic.ecg";
         public const string PluginName = "Realistic Cardiac & ECG Mod";
-        public const string PluginVersion = "1.0.0";
+        public const string PluginVersion = "1.1.0";
+
+        internal static RealisticEcgPlugin? Instance { get; private set; }
 
         private Harmony? _harmony;
         private ConfigEntry<FrontalLead>? _defaultLeadConfig;
+        private ConfigEntry<float>? _monitorPosXConfig;
+        private ConfigEntry<float>? _monitorPosYConfig;
 
         private void Awake()
         {
+            Instance = this;
+
             _defaultLeadConfig = Config.Bind(
                 "ECG",
                 "DefaultFrontalLead",
                 FrontalLead.II,
                 "Default frontal plane ECG lead displayed by the monitor (I, II, III, aVR, aVL, aVF).");
+
+            _monitorPosXConfig = Config.Bind(
+                "MonitorOverlay",
+                "WindowPosX",
+                -24f,
+                "Saved horizontal anchored position of the draggable real-time physiology monitor window.");
+
+            _monitorPosYConfig = Config.Bind(
+                "MonitorOverlay",
+                "WindowPosY",
+                -90f,
+                "Saved vertical anchored position of the draggable real-time physiology monitor window.");
 
             CardiacModManager.DefaultLead = _defaultLeadConfig.Value;
             _defaultLeadConfig.SettingChanged += (_, _) =>
@@ -37,8 +55,28 @@ namespace RealisticEcgMod
 
             HookAmiodaroneLiquid();
             HookEpinephrineLiquid();
+            HookNitroprussideLiquid();
+            HookVasopressinLiquid();
             CUCoreIntegration.RegisterAll(Logger);
+            PhysiologyMonitorApi.RegisterBuiltInArterialPressureCurve();
             Logger.LogInfo($"{PluginName} v{PluginVersion} loaded (Default Lead: {CardiacModManager.DefaultLead}).");
+        }
+
+        internal static Vector2 GetSavedMonitorOverlayPosition()
+        {
+            if (Instance?._monitorPosXConfig != null && Instance._monitorPosYConfig != null)
+            {
+                return new Vector2(Instance._monitorPosXConfig.Value, Instance._monitorPosYConfig.Value);
+            }
+            return new Vector2(-24f, -90f);
+        }
+
+        internal static void SaveMonitorOverlayPosition(Vector2 anchoredPosition)
+        {
+            if (Instance?._monitorPosXConfig == null || Instance._monitorPosYConfig == null) return;
+            Instance._monitorPosXConfig.Value = anchoredPosition.x;
+            Instance._monitorPosYConfig.Value = anchoredPosition.y;
+            Instance.Config.Save();
         }
 
         private void HookEpinephrineLiquid()
@@ -86,9 +124,54 @@ namespace RealisticEcgMod
             }
         }
 
+        private void HookNitroprussideLiquid()
+        {
+            if (Liquids.Registry != null && Liquids.Registry.TryGetValue("sodiumnitroprusside", out var nitroLiquid))
+            {
+                nitroLiquid.onHealthUse = (ml, limb) =>
+                {
+                    if (limb?.body == null) return;
+                    CardiacModManager.AdministerNitroprusside(limb.body, ml, intravenous: true);
+                };
+                nitroLiquid.onDrink = (ml, body) =>
+                {
+                    if (body == null) return;
+                    CardiacModManager.AdministerNitroprusside(body, ml, intravenous: false);
+                };
+                Logger.LogInfo("Patched Liquids.Registry[\"sodiumnitroprusside\"] with dose-dependent vasodilator PK (t1/2 = 50s).");
+            }
+            else
+            {
+                Logger.LogWarning("Could not find 'sodiumnitroprusside' in Liquids.Registry during Awake.");
+            }
+        }
+
+        private void HookVasopressinLiquid()
+        {
+            if (Liquids.Registry != null && Liquids.Registry.TryGetValue("vasopressin", out var vasoLiquid))
+            {
+                vasoLiquid.onHealthUse = (ml, limb) =>
+                {
+                    if (limb?.body == null) return;
+                    CardiacModManager.AdministerVasopressin(limb.body, ml, intravenous: true);
+                };
+                vasoLiquid.onDrink = (ml, body) =>
+                {
+                    if (body == null) return;
+                    CardiacModManager.AdministerVasopressin(body, ml, intravenous: false);
+                };
+                Logger.LogInfo("Patched Liquids.Registry[\"vasopressin\"] (抗利尿激素) with pure dose-dependent V1 vasoconstrictor PK (t1/2 = 120s).");
+            }
+            else
+            {
+                Logger.LogWarning("Could not find 'vasopressin' in Liquids.Registry during Awake.");
+            }
+        }
+
         private void OnDestroy()
         {
             _harmony?.UnpatchSelf();
+            PhysiologyMonitorOverlay.DestroyInstance();
             CardiacModManager.DisposeAll();
         }
     }

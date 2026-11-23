@@ -227,7 +227,93 @@ namespace CardiacSimVerifier
             var exoOverdoseTrace = RunScenario("14b. Exogenous Adrenaline Overdose (2.6)", sim, 5.0f, reset: false);
             Console.WriteLine($"  [Exogenous Overdose Check] Rhythm={sim.CurrentRhythm}, HR={sim.MeasuredHeartRateBpm:F1}, LV_SV={sim.GetLeftVentricularEjectionVolumeMl():F1} mL\n");
 
-            // 15. Performance & 20x Worker Thread Benchmark
+            // 15. V1.1.0 Real-Time Pulsatile Arterial Pressure (Normal Sinus 72 BPM -> ~120/80, MAP ~93, Beat LV SV)
+            sim.ResetToSinus(clearDrugs: true, resetEnvironment: true, targetBpm: 72f);
+            sim.Step(8.0f);
+            Console.WriteLine("--- 15. Real-Time Pulsatile ABP (Normal Sinus 72 BPM) ---");
+            Console.WriteLine($"  ABP_5s={sim.SystolicBp5s:F1}/{sim.DiastolicBp5s:F1} mmHg (MAP={sim.MeanArterialPressure5s:F1}), " +
+                              $"LastBeat_LV_SV={sim.GetLastBeatLvStrokeVolumeMl():F1} mL, Beats={sim.CompletedBeatCount}, " +
+                              $"Tone={sim.EffectiveVascularTone:F2}, Diam={sim.EffectiveVesselDiameter:F2}\n");
+            if (sim.SystolicBp5s < 105f || sim.SystolicBp5s > 138f || sim.DiastolicBp5s < 65f || sim.DiastolicBp5s > 92f)
+                throw new InvalidOperationException($"Normal sinus ABP out of physiological range: {sim.SystolicBp5s:F1}/{sim.DiastolicBp5s:F1}");
+
+            // 16. VF Arterial Collapse + AutoPump Mechanical CPR Pulse (every 0.3s -> sustains MAP > 46.5 / BP > 60)
+            sim.InduceVentricularFibrillation();
+            sim.Step(8.0f);
+            float vfCollapseMap = sim.MeanArterialPressure5s;
+            float vfCollapseSbp = sim.SystolicBp5s;
+            float vfCollapseDbp = sim.DiastolicBp5s;
+            // Now simulate AutoPump firing every 0.3s while vanilla-equiv BP < 85 (MAP < 66)
+            for (int tick = 0; tick < 40; tick++)
+            {
+                float vanillaBpEq = sim.MeanArterialPressure5s * (120f / 93.333f);
+                if (vanillaBpEq < 85f)
+                    sim.InjectCprPulse(26f);
+                sim.Step(0.3f);
+            }
+            float cprMap = sim.MeanArterialPressure5s;
+            float cprVanillaBp = cprMap * (120f / 93.333f);
+            Console.WriteLine("--- 16. VF Collapse -> AutoPump CPR Pulses ---");
+            Console.WriteLine($"  Untreated VF ABP: {vfCollapseSbp:F1}/{vfCollapseDbp:F1} (MAP={vfCollapseMap:F1}) -> " +
+                              $"AutoPump CPR ABP: {sim.SystolicBp5s:F1}/{sim.DiastolicBp5s:F1} (MAP={cprMap:F1}, VanillaBP={cprVanillaBp:F1})\n");
+            if (vfCollapseMap > 28f || cprVanillaBp <= 60f)
+                throw new InvalidOperationException($"VF collapse / CPR pulse check failed! vfMAP={vfCollapseMap:F1}, cprVanillaBP={cprVanillaBp:F1}");
+
+            // 17. Severe Hypertensive Crisis (Exogenous Epinephrine) -> Rapid Reversal via Dose-Dependent Nitroprusside (t1/2 = 50s)
+            sim.ResetToSinus(clearDrugs: true, resetEnvironment: true, targetBpm: 92f);
+            sim.Environment.Adrenaline = 2.4f;
+            sim.Step(10.0f);
+            float crisisSbp = sim.SystolicBp5s;
+            float crisisDbp = sim.DiastolicBp5s;
+            string crisisInfo = $"Rhythm={sim.CurrentRhythm}, HR={sim.MeasuredHeartRateBpm:F1}, Sync={sim.VentricularSynchrony:F2}, Tone={sim.EffectiveVascularTone:F2}, LastSV={sim.GetLastBeatLvStrokeVolumeMl():F1}";
+            sim.AdministerNitroprusside(2.5f); // 25 mL IV bolus
+            sim.Step(10.0f);
+            float postNitroSbp = sim.SystolicBp5s;
+            float postNitroDbp = sim.DiastolicBp5s;
+            Console.WriteLine("--- 17. Epinephrine Hypertensive Crisis -> Nitroprusside Reversal ---");
+            Console.WriteLine($"  Crisis ABP={crisisSbp:F1}/{crisisDbp:F1} mmHg ({crisisInfo})");
+            Console.WriteLine($"  Post-Nitroprusside (10s) ABP={postNitroSbp:F1}/{postNitroDbp:F1} mmHg (Rhythm={sim.CurrentRhythm}, NitroConc={sim.NitroprussideConcentration:F2}, Tone={sim.EffectiveVascularTone:F2})\n");
+            if (crisisSbp < 190f || postNitroSbp >= crisisSbp - 50f)
+                throw new InvalidOperationException($"Hypertensive crisis / Nitroprusside reversal check failed! crisis={crisisSbp:F1}/{crisisDbp:F1}, post={postNitroSbp:F1}/{postNitroDbp:F1}");
+
+            // 18. Pure Dose-Dependent Vasopressin / ADH (t1/2 = 120s)
+            sim.ResetToSinus(clearDrugs: true, resetEnvironment: true, targetBpm: 72f);
+            sim.Environment.VascularTone = 0.55f; // Septic/vasoplegic shock baseline
+            sim.Step(8.0f);
+            float shockMap = sim.MeanArterialPressure5s;
+            float shockHr = sim.MeasuredHeartRateBpm;
+            sim.AdministerVasopressin(2.0f); // 20 mL IV bolus
+            sim.Step(12.0f);
+            float postVasoMap = sim.MeanArterialPressure5s;
+            float postVasoHr = sim.MeasuredHeartRateBpm;
+            Console.WriteLine("--- 18. Vasoplegia -> Vasopressin (ADH, t1/2=120s) Pure V1 Pressor ---");
+            Console.WriteLine($"  Vasoplegic MAP={shockMap:F1} (HR={shockHr:F1}) -> Post-ADH MAP={postVasoMap:F1} (HR={postVasoHr:F1}, VasoConc={sim.VasopressinConcentration:F2}, Tone={sim.EffectiveVascularTone:F2})\n");
+            if (postVasoMap <= shockMap + 15f)
+                throw new InvalidOperationException($"Vasopressin pressor effect too weak! shockMAP={shockMap:F1}, postMAP={postVasoMap:F1}");
+
+            // 19. Clinical Dose-Staged Dopamine (t1/2 = 75s): Low/Mod beta1 inotropy+HR -> High alpha1 vasoconstriction
+            sim.ResetToSinus(clearDrugs: true, resetEnvironment: true, targetBpm: 68f);
+            sim.Step(6.0f);
+            float baseHr = sim.MeasuredHeartRateBpm;
+            float baseTone = sim.EffectiveVascularTone;
+            float baseMap = sim.MeanArterialPressure5s;
+            sim.AdministerDopamine(1.0f); // 10 mL IV -> beta1 range
+            sim.Step(9.0f);
+            float modDopaHr = sim.MeasuredHeartRateBpm;
+            float modDopaTone = sim.EffectiveVascularTone;
+            float modDopaMap = sim.MeanArterialPressure5s;
+            sim.AdministerDopamine(2.5f); // additional 25 mL IV -> high-dose alpha1 pressor
+            sim.Step(9.0f);
+            float highDopaTone = sim.EffectiveVascularTone;
+            float highDopaMap = sim.MeanArterialPressure5s;
+            Console.WriteLine("--- 19. Clinical Dose-Staged Dopamine (t1/2=75s) ---");
+            Console.WriteLine($"  Base: HR={baseHr:F1}, Tone={baseTone:F2}, MAP={baseMap:F1} | " +
+                              $"Mod(beta1): HR={modDopaHr:F1}, Tone={modDopaTone:F2}, MAP={modDopaMap:F1} | " +
+                              $"High(alpha1): Tone={highDopaTone:F2}, MAP={highDopaMap:F1} (SBP={sim.SystolicBp5s:F1}/{sim.DiastolicBp5s:F1})\n");
+            if (modDopaHr <= baseHr + 5f || highDopaTone <= modDopaTone + 0.25f || highDopaMap <= modDopaMap + 12f)
+                throw new InvalidOperationException("Dopamine dose-staged beta1 -> alpha1 check failed!");
+
+            // 20. Performance & 20x Worker Thread Benchmark
             RunPerformanceBenchmarks();
 
             // Write interactive HTML report to scratch for visual inspection if desired

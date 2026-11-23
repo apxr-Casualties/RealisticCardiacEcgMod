@@ -46,8 +46,11 @@ namespace RealisticEcgMod
 
     internal sealed class WoundViewLeadUi
     {
-        public Button? Button;
-        public TextMeshProUGUI? Label;
+        public Button? LeadButton;
+        public TextMeshProUGUI? LeadLabel;
+        public Button? MultiLeadButton;
+        public Button? MonitorOverlayButton;
+        public Image? MonitorOverlayBg;
         public bool Initialized;
     }
 
@@ -89,6 +92,21 @@ namespace RealisticEcgMod
 
         private static readonly AccessTools.FieldRef<AEDMinigame, TextMeshProUGUI> AedTextRef =
             AccessTools.FieldRefAccess<AEDMinigame, TextMeshProUGUI>("text");
+
+        private static readonly AccessTools.FieldRef<AutoPump, Item> AutoPumpItemRef =
+            AccessTools.FieldRefAccess<AutoPump, Item>("item");
+
+        private static readonly AccessTools.FieldRef<AutoPump, float> AutoPumpCooldownRef =
+            AccessTools.FieldRefAccess<AutoPump, float>("coolDown");
+
+        private static readonly AccessTools.FieldRef<AutoPump, float> AutoPumpWearCheckRef =
+            AccessTools.FieldRefAccess<AutoPump, float>("wearCheckTime");
+
+        private static readonly AccessTools.FieldRef<AutoPump, bool> AutoPumpWornRef =
+            AccessTools.FieldRefAccess<AutoPump, bool>("worn");
+
+        private static readonly Func<AutoPump, Body?> AutoPumpBodyGetter =
+            AccessTools.MethodDelegate<Func<AutoPump, Body?>>(AccessTools.PropertyGetter(typeof(AutoPump), "body"));
 
         [HarmonyPatch(typeof(Body), "Start")]
         [HarmonyPostfix]
@@ -167,17 +185,51 @@ namespace RealisticEcgMod
                 __instance.heartRate = snap.HeartRateBpm;
             }
 
-            // Recompute blood pressure using Left Ventricular Ejection Output instead of vanilla heartRate
-            float targetBp = CardiacModManager.ComputeBloodPressureFromLvEjection(__instance, painkillers, in snap);
-            float lerpRate = targetBp < 20f ? 0.45f : 0.25f;
-            __instance.bloodPressure = Mathf.Clamp(
-                Mathf.Lerp(ctrl.PrevBloodPressure, targetBp, Time.deltaTime * lerpRate),
-                0f,
-                250f);
+            // Compute vanilla-equivalent internal bloodPressure from rolling 5s arterial MAP + vascular tone
+            __instance.bloodPressure = CardiacModManager.ComputeVanillaBloodPressureFromArterial(__instance, in snap);
 
-            __instance.bloodPressureReadout =
-                Mathf.RoundToInt(__instance.bloodPressure).ToString() + "/" +
-                Mathf.RoundToInt(__instance.bloodPressure * 0.66f).ToString();
+            // Display real rolling 5-second arterial systolic / diastolic pressure across WoundView & Defib
+            int sbp = __instance.alive ? Mathf.RoundToInt(snap.SystolicBp5s) : 0;
+            int dbp = __instance.alive ? Mathf.RoundToInt(snap.DiastolicBp5s) : 0;
+            __instance.bloodPressureReadout = sbp.ToString() + "/" + dbp.ToString();
+        }
+
+        [HarmonyPatch(typeof(AutoPump), "Update")]
+        [HarmonyPrefix]
+        private static bool AutoPump_Update_Prefix(AutoPump __instance)
+        {
+            if (__instance == null) return false;
+
+            ref float coolDown = ref AutoPumpCooldownRef(__instance);
+            ref float wearCheckTime = ref AutoPumpWearCheckRef(__instance);
+            ref bool worn = ref AutoPumpWornRef(__instance);
+            Item? item = AutoPumpItemRef(__instance);
+            Body? body = AutoPumpBodyGetter(__instance);
+
+            coolDown -= Time.deltaTime;
+            wearCheckTime -= Time.deltaTime;
+
+            if (wearCheckTime < 0f)
+            {
+                wearCheckTime = 1f;
+                worn = body != null && item != null && body.HasWearable(item);
+            }
+
+            if (!worn || item == null || item.battery == null || !item.battery.hasCharge || body == null)
+                return false;
+
+            item.battery.DrainCharge(Time.deltaTime / 1200f);
+
+            if (body.bloodPressure < 85f && coolDown <= 0f)
+            {
+                coolDown = 0.3f;
+                // Inject real mechanical CPR arterial compression pulse into Windkessel model instead of raw BP addition
+                CardiacModManager.InjectCprPulse(body, 26f);
+                item.battery.DrainCharge(0.002f);
+                Sound.Play("autopump", Vector2.zero, true, true, null, 0.6f, 1f, false, false);
+            }
+
+            return false;
         }
 
         [HarmonyPatch(typeof(Body), nameof(Body.GetECGHeight))]
@@ -291,6 +343,15 @@ namespace RealisticEcgMod
             {
                 CardiacModManager.OpenOrToggleMultiLeadMinigame(__instance.body, item: null);
             }
+
+            KeyCode boundMonitorKey = KeyBinds.GetBind("realisticecg.monitor_overlay_hotkey");
+            KeyCode activeMonitorKey = boundMonitorKey != KeyCode.None ? boundMonitorKey : CardiacModManager.MonitorOverlayKey;
+            CardiacModManager.MonitorOverlayKey = activeMonitorKey;
+
+            if (activeMonitorKey != KeyCode.None && Input.GetKeyDown(activeMonitorKey))
+            {
+                CardiacModManager.ToggleMonitorOverlay(__instance.body);
+            }
         }
 
         [HarmonyPatch(typeof(WoundView), nameof(WoundView.UpdateView))]
@@ -305,16 +366,33 @@ namespace RealisticEcgMod
                 ECGVisualizer? chipEcg = FindChipPanelEcgVisualizer(__instance);
                 if (chipEcg != null)
                 {
-                    CreateWoundViewLeadButton(__instance, chipEcg, ui);
+                    CreateWoundViewChipButtons(__instance, chipEcg, ui);
                     ui.Initialized = true;
                 }
             }
 
-            if (ui.Label != null)
+            bool hasChip = !WorldGeneration.unchipped;
+            if (ui.LeadButton != null && ui.LeadButton.gameObject.activeSelf != hasChip)
+                ui.LeadButton.gameObject.SetActive(hasChip);
+            if (ui.MultiLeadButton != null && ui.MultiLeadButton.gameObject.activeSelf != hasChip)
+                ui.MultiLeadButton.gameObject.SetActive(hasChip);
+            if (ui.MonitorOverlayButton != null && ui.MonitorOverlayButton.gameObject.activeSelf != hasChip)
+                ui.MonitorOverlayButton.gameObject.SetActive(hasChip);
+
+            if (ui.LeadLabel != null)
             {
                 string leadLabel = CardiacModManager.GetFrontalLeadLabel(CardiacModManager.GetSelectedLead(__instance.body));
-                ui.Label.text = $"{leadLabel} ⇄";
+                ui.LeadLabel.text = $"{leadLabel} ⇄";
             }
+
+            if (ui.MonitorOverlayBg != null)
+            {
+                ui.MonitorOverlayBg.color = PhysiologyMonitorOverlay.IsOpen
+                    ? new Color(0.24f, 0.12f, 0.14f, 0.96f)
+                    : new Color(0.14f, 0.09f, 0.10f, 0.92f);
+            }
+
+            PhysiologyMonitorOverlay.SyncWithWoundView(__instance);
         }
 
         private static ECGVisualizer? FindChipPanelEcgVisualizer(WoundView view)
@@ -335,7 +413,7 @@ namespace RealisticEcgMod
             return null;
         }
 
-        private static void CreateWoundViewLeadButton(WoundView view, ECGVisualizer chipEcg, WoundViewLeadUi ui)
+        private static void CreateWoundViewChipButtons(WoundView view, ECGVisualizer chipEcg, WoundViewLeadUi ui)
         {
             var ecgRt = chipEcg.GetComponent<RectTransform>();
             if (ecgRt == null) return;
@@ -343,30 +421,135 @@ namespace RealisticEcgMod
             bool hasMask = chipEcg.GetComponent<Mask>() != null || chipEcg.GetComponent<RectMask2D>() != null;
             Transform parent = hasMask && ecgRt.parent != null ? ecgRt.parent : ecgRt;
 
-            var btnGo = new GameObject("CardiacLeadSwitchBtn", typeof(RectTransform), typeof(Image), typeof(Button));
+            Vector2 baseAnchorMin = hasMask && ecgRt.parent != null ? ecgRt.anchorMin : new Vector2(1f, 0.5f);
+            Vector2 baseAnchorMax = hasMask && ecgRt.parent != null ? ecgRt.anchorMax : new Vector2(1f, 0.5f);
+            float baseX = hasMask && ecgRt.parent != null
+                ? ecgRt.anchoredPosition.x + (1f - ecgRt.pivot.x) * ecgRt.rect.width + 6f
+                : 6f;
+            float baseY = hasMask && ecgRt.parent != null
+                ? ecgRt.anchoredPosition.y + (0.5f - ecgRt.pivot.y) * ecgRt.rect.height
+                : 0f;
+
+            const float btnWidth = 58f;
+            const float btnHeight = 20f;
+            const float verticalStep = 22f;
+
+            // 1. Top button: Lead Switch (I / II / III / aVR / aVL / aVF)
+            var leadBtn = CreateStackedChipButton(
+                parent,
+                "CardiacLeadSwitchBtn",
+                view.bpmText?.font,
+                baseAnchorMin,
+                baseAnchorMax,
+                new Vector2(baseX, baseY + verticalStep),
+                new Vector2(btnWidth, btnHeight),
+                new Color(0.08f, 0.16f, 0.14f, 0.92f),
+                new Color(0.42f, 1f, 0.68f, 1f),
+                "II ⇄",
+                12f,
+                "切换心电导联",
+                "点击循环切换额面导联 (I / II / III / aVR / aVL / aVF)，并与除颤仪及昏迷监控同步",
+                out var leadTmp,
+                out _);
+
+            leadBtn.onClick.AddListener(() =>
+            {
+                Body? targetBody = view.body != null ? view.body : (PlayerCamera.main != null ? PlayerCamera.main.body : null);
+                if (targetBody == null) return;
+                FrontalLead next = CardiacModManager.CycleSelectedLead(targetBody, +1);
+                leadTmp.text = $"{CardiacModManager.GetFrontalLeadLabel(next)} ⇄";
+                if (PlayerCamera.main != null)
+                    PlayerCamera.main.PlayUISound(PlayerCamera.UISoundType.MiniClick, 1.1f);
+            });
+
+            // 2. Middle button: Directly open/toggle 6-lead ECG minigame
+            var multiLeadBtn = CreateStackedChipButton(
+                parent,
+                "CardiacMultiLeadBtn",
+                view.bpmText?.font,
+                baseAnchorMin,
+                baseAnchorMax,
+                new Vector2(baseX, baseY),
+                new Vector2(btnWidth, btnHeight),
+                new Color(0.08f, 0.14f, 0.20f, 0.92f),
+                new Color(0.55f, 0.92f, 1f, 1f),
+                "6导联",
+                11.5f,
+                "打开六导联心电图",
+                "直接打开标准网格六导联额面心电图检测界面（可调走纸速度与增益）",
+                out _,
+                out _);
+
+            multiLeadBtn.onClick.AddListener(() =>
+            {
+                Body? targetBody = view.body != null ? view.body : (PlayerCamera.main != null ? PlayerCamera.main.body : null);
+                if (targetBody == null) return;
+                CardiacModManager.OpenOrToggleMultiLeadMinigame(targetBody, item: null);
+                if (PlayerCamera.main != null)
+                    PlayerCamera.main.PlayUISound(PlayerCamera.UISoundType.MiniClick, 1.05f);
+            });
+
+            // 3. Bottom button: Open/toggle draggable real-time arterial pressure & multi-curve monitor overlay
+            var monitorBtn = CreateStackedChipButton(
+                parent,
+                "CardiacMonitorOverlayBtn",
+                view.bpmText?.font,
+                baseAnchorMin,
+                baseAnchorMax,
+                new Vector2(baseX, baseY - verticalStep),
+                new Vector2(btnWidth, btnHeight),
+                new Color(0.14f, 0.09f, 0.10f, 0.92f),
+                new Color(1f, 0.56f, 0.56f, 1f),
+                "动脉压",
+                11.5f,
+                "实时生理监护曲线",
+                "开关可拖动实时动脉血压波形与多曲线生理监护面板（关闭医疗面板时自动隐藏）",
+                out _,
+                out var monitorBg);
+
+            monitorBtn.onClick.AddListener(() =>
+            {
+                Body? targetBody = view.body != null ? view.body : (PlayerCamera.main != null ? PlayerCamera.main.body : null);
+                if (targetBody == null) return;
+                CardiacModManager.ToggleMonitorOverlay(targetBody);
+            });
+
+            ui.LeadButton = leadBtn;
+            ui.LeadLabel = leadTmp;
+            ui.MultiLeadButton = multiLeadBtn;
+            ui.MonitorOverlayButton = monitorBtn;
+            ui.MonitorOverlayBg = monitorBg;
+        }
+
+        private static Button CreateStackedChipButton(
+            Transform parent,
+            string name,
+            TMP_FontAsset? font,
+            Vector2 anchorMin,
+            Vector2 anchorMax,
+            Vector2 anchoredPos,
+            Vector2 size,
+            Color bgColor,
+            Color textColor,
+            string initialText,
+            float fontSize,
+            string tipName,
+            string tipDesc,
+            out TextMeshProUGUI labelOut,
+            out Image bgOut)
+        {
+            var btnGo = new GameObject(name, typeof(RectTransform), typeof(Image), typeof(Button));
             btnGo.transform.SetParent(parent, false);
 
             var rt = btnGo.GetComponent<RectTransform>();
-            rt.sizeDelta = new Vector2(54f, 24f);
-            if (hasMask && ecgRt.parent != null)
-            {
-                rt.anchorMin = ecgRt.anchorMin;
-                rt.anchorMax = ecgRt.anchorMax;
-                rt.pivot = new Vector2(0f, 0.5f);
-                rt.anchoredPosition = new Vector2(
-                    ecgRt.anchoredPosition.x + (1f - ecgRt.pivot.x) * ecgRt.rect.width + 6f,
-                    ecgRt.anchoredPosition.y + (0.5f - ecgRt.pivot.y) * ecgRt.rect.height);
-            }
-            else
-            {
-                rt.anchorMin = new Vector2(1f, 0.5f);
-                rt.anchorMax = new Vector2(1f, 0.5f);
-                rt.pivot = new Vector2(0f, 0.5f);
-                rt.anchoredPosition = new Vector2(6f, 0f);
-            }
+            rt.anchorMin = anchorMin;
+            rt.anchorMax = anchorMax;
+            rt.pivot = new Vector2(0f, 0.5f);
+            rt.sizeDelta = size;
+            rt.anchoredPosition = anchoredPos;
 
-            var img = btnGo.GetComponent<Image>();
-            img.color = new Color(0.08f, 0.16f, 0.14f, 0.92f);
+            bgOut = btnGo.GetComponent<Image>();
+            bgOut.color = bgColor;
 
             var txtGo = new GameObject("Label", typeof(RectTransform), typeof(TextMeshProUGUI));
             txtGo.transform.SetParent(btnGo.transform, false);
@@ -375,31 +558,20 @@ namespace RealisticEcgMod
             txtRt.anchorMax = Vector2.one;
             txtRt.sizeDelta = Vector2.zero;
 
-            var tmp = txtGo.GetComponent<TextMeshProUGUI>();
-            if (view.bpmText != null) tmp.font = view.bpmText.font;
-            tmp.fontSize = 13f;
-            tmp.alignment = TextAlignmentOptions.Center;
-            tmp.color = new Color(0.42f, 1f, 0.68f, 1f);
-            tmp.raycastTarget = false;
+            labelOut = txtGo.GetComponent<TextMeshProUGUI>();
+            if (font != null) labelOut.font = font;
+            labelOut.fontSize = fontSize;
+            labelOut.alignment = TextAlignmentOptions.Center;
+            labelOut.color = textColor;
+            labelOut.text = initialText;
+            labelOut.raycastTarget = false;
 
             var tooltip = btnGo.AddComponent<UITooltip>();
             tooltip.skipLocale = true;
-            tooltip.tipName = "切换心电导联";
-            tooltip.tipDesc = "点击循环切换额面导联 (I / II / III / aVR / aVL / aVF)，并与除颤仪及昏迷监控同步";
+            tooltip.tipName = tipName;
+            tooltip.tipDesc = tipDesc;
 
-            var btn = btnGo.GetComponent<Button>();
-            btn.onClick.AddListener(() =>
-            {
-                Body targetBody = view.body != null ? view.body : (PlayerCamera.main != null ? PlayerCamera.main.body : null!);
-                if (targetBody == null) return;
-                FrontalLead next = CardiacModManager.CycleSelectedLead(targetBody, +1);
-                tmp.text = $"{CardiacModManager.GetFrontalLeadLabel(next)} ⇄";
-                if (PlayerCamera.main != null)
-                    PlayerCamera.main.PlayUISound(PlayerCamera.UISoundType.MiniClick, 1.1f);
-            });
-
-            ui.Button = btn;
-            ui.Label = tmp;
+            return btnGo.GetComponent<Button>();
         }
 
         [HarmonyPatch(typeof(ManualDefibMinigame), nameof(ManualDefibMinigame.Start))]
@@ -812,7 +984,6 @@ namespace RealisticEcgMod
                 info.limb.body.fibrillationProgress = 0f;
                 info.limb.body.defibShockedFrames = 20;
                 info.limb.body.heartProg = -1f;
-                info.limb.body.bloodPressure = Mathf.Min(info.limb.body.bloodPressure, 40f);
             }
 
             return false;

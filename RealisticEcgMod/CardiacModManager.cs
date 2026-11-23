@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using BepInEx.Bootstrap;
 using CardiacSimCore;
 using UnityEngine;
 
@@ -56,6 +57,23 @@ namespace RealisticEcgMod
 
         public static FrontalLead DefaultLead { get; set; } = FrontalLead.II;
         public static KeyCode MultiLeadEcgKey { get; set; } = KeyCode.G;
+        public static KeyCode MonitorOverlayKey { get; set; } = KeyCode.None;
+
+        private const string NeurologyOverhaulGuid = "com.casualties.neurology.overhaul";
+        private static bool? _neurologyModDetected;
+
+        public static bool IsNeurologyOverhaulLoaded
+        {
+            get
+            {
+                if (!_neurologyModDetected.HasValue)
+                {
+                    _neurologyModDetected = Chainloader.PluginInfos != null &&
+                                            Chainloader.PluginInfos.ContainsKey(NeurologyOverhaulGuid);
+                }
+                return _neurologyModDetected.Value;
+            }
+        }
 
         private static readonly FrontalLead[] AllFrontalLeads =
         {
@@ -245,6 +263,48 @@ namespace RealisticEcgMod
             float focalTransmural = isch > 0.38f ? Mathf.Clamp01((isch - 0.38f) / 0.55f) : 0f;
             float globalIsch = isch > 0.30f ? Mathf.Clamp01((isch - 0.30f) / 0.65f) : 0f;
 
+            // Convert all vanilla direct BP modifiers into physiological vascular tone, vessel diameter, viscosity & venous return
+            float vesselDiameter = Mathf.Clamp(body.bloodVesselSize > 0.05f ? body.bloodVesselSize : 1.0f, 0.55f, 1.65f);
+            float sepsisTone = Mathf.Clamp(1f - body.septicShock * 0.00525f, 0.32f, 1.05f);
+            float opiateTone = painkillers != null
+                ? Mathf.Clamp(1f - painkillers.actualOpiateReception / 400f, 0.72f, 1.15f)
+                : 1.0f;
+            float tempTone = Mathf.Clamp(1f - body.tempDiffFromNormal / 45f, 0.72f, 1.35f);
+            float weightTone = Mathf.Clamp(1f + body.weightOffset / 180f, 0.85f, 1.25f);
+            float vascularTone = sepsisTone * opiateTone * tempTone * weightTone;
+
+            // Antidepressants overdose (>= 250) -> vasoplegia (replaces vanilla direct BP subtraction)
+            if (body.TryGetComponent<Antidepressants>(out var antidepressants) && antidepressants.currentAmount >= 250f)
+            {
+                float sev = Mathf.Clamp01((antidepressants.currentAmount - 250f) / 250f);
+                vascularTone *= Mathf.Lerp(0.72f, 0.48f, sev);
+                vesselDiameter = Mathf.Clamp(vesselDiameter * Mathf.Lerp(1.08f, 1.20f, sev), 0.55f, 1.65f);
+            }
+
+            // SleepingPills overdose -> central sympatholytic vasodilation (replaces vanilla direct BP subtraction)
+            if (body.TryGetComponent<SleepingPills>(out var sleepingPills))
+            {
+                float threshold = (painkillers != null && painkillers.actualOpiateReception > 15f) ? 150f : 900f;
+                if (sleepingPills.amount > threshold)
+                {
+                    vascularTone *= body.conscious ? 0.72f : 0.52f;
+                    vesselDiameter = Mathf.Clamp(vesselDiameter * (body.conscious ? 1.08f : 1.18f), 0.55f, 1.65f);
+                }
+            }
+
+            // Fallback compatibility for any other third-party mod still writing vanilla bloodPressureChangeFromMedicine
+            if (body.bloodPressureChangeFromMedicine > 0.5f)
+                vascularTone *= 0.75f;
+            else if (body.bloodPressureChangeFromMedicine < -0.5f)
+                vascularTone *= 1.25f;
+
+            float viscosityFactor = Mathf.Clamp(1f + body.bloodViscosity / 200f, 0.55f, 2.0f);
+            float venousReturnFactor = Mathf.Clamp(body.thirstBloodPressure > 0.05f ? body.thirstBloodPressure : 1.0f, 0.50f, 1.30f);
+
+            bool allowAtpRecovery = body.alive &&
+                                    body.bloodOxygen > 50f &&
+                                    (body.bloodPressure > 60f || ctrl.LastSnapshot.MeanArterialPressure5s > 46.5f);
+
             return new CardiacEnvironmentInput
             {
                 TargetSinusBpm = targetBpm,
@@ -252,11 +312,43 @@ namespace RealisticEcgMod
                 FocalTransmuralIschemia = focalTransmural,
                 SubendocardialIschemia = subendoIsch,
                 RightVentricularIschemia = 0f,
-                PreloadFactor = Mathf.Clamp(body.bloodVolumePercentage, 0.15f, 1.35f),
+                PreloadFactor = Mathf.Clamp(body.bloodVolumePercentage, 0.12f, 1.35f),
                 TemperatureC = Mathf.Clamp(body.temperature, 20f, 44f),
                 Adrenaline = Mathf.Max(0f, totalAdrenaline / 100f),
-                AllowAtpRecovery = body.alive && body.bloodPressure > 60f && body.bloodOxygen > 50f
+                AllowAtpRecovery = allowAtpRecovery,
+                VascularTone = Mathf.Clamp(vascularTone, 0.22f, 3.5f),
+                VesselDiameter = vesselDiameter,
+                BloodViscosityFactor = viscosityFactor,
+                VenousReturnFactor = venousReturnFactor,
+                ExternalAutonomicControl = IsNeurologyOverhaulLoaded
             };
+        }
+
+        /// <summary>
+        /// Compute vanilla-equivalent internal Body.bloodPressure (baseline 120) from rolling 5s arterial MAP
+        /// plus vascular-tone &amp; hypertensive-crisis corrections so vanilla perfusion/shock/moodle checks stay accurate.
+        /// </summary>
+        public static float ComputeVanillaBloodPressureFromArterial(Body body, in CardiacTelemetrySnapshot snap)
+        {
+            if (body == null || !body.alive)
+                return 0f;
+
+            // 93.333 mmHg normal MAP (120/80) maps directly to vanilla's 120 baseline
+            float mapEq = Mathf.Max(0f, snap.MeanArterialPressure5s) * (120f / 93.333f);
+
+            // Severe vasoplegia slightly degrades effective end-organ perfusion pressure
+            if (snap.EffectiveVascularTone < 0.72f)
+            {
+                mapEq *= Mathf.Clamp(0.84f + 0.22f * snap.EffectiveVascularTone, 0.72f, 1.0f);
+            }
+
+            // Hypertensive crisis systolic surge ensures vanilla high-BP warnings/mechanics respond appropriately
+            if (snap.SystolicBp5s > 175f)
+            {
+                mapEq += (snap.SystolicBp5s - 175f) * 0.35f;
+            }
+
+            return Mathf.Clamp(mapEq, 0f, 250f);
         }
 
         /// <summary>
@@ -347,6 +439,77 @@ namespace RealisticEcgMod
             {
                 ctrl.ExogenousAdrenalineDepot += overflow;
             }
+        }
+
+        /// <summary>
+        /// Intravenous/oral Sodium Nitroprusside: potent dose-dependent vasodilator (t1/2 = 50s).
+        /// Standard 20 mL IV push = 2.0 dose units (swiftly pulls hypertensive crisis down).
+        /// </summary>
+        public static void AdministerNitroprusside(Body? body, float ml, bool intravenous)
+        {
+            if (body == null || ml <= 0f) return;
+            var ctrl = GetOrCreate(body);
+            float doseUnits = ml * (intravenous ? 0.10f : 0.015f);
+            ctrl.Worker.EnqueueCommand(sim => sim.AdministerNitroprusside(doseUnits));
+        }
+
+        /// <summary>
+        /// Intravenous/oral Vasopressin (抗利尿激素 / ADH): pure dose-dependent V1 vasoconstrictor (t1/2 = 120s).
+        /// Standard 20 mL IV push = 2.0 dose units.
+        /// </summary>
+        public static void AdministerVasopressin(Body? body, float ml, bool intravenous)
+        {
+            if (body == null || ml <= 0f) return;
+            var ctrl = GetOrCreate(body);
+            float doseUnits = ml * (intravenous ? 0.10f : 0.015f);
+            ctrl.Worker.EnqueueCommand(sim => sim.AdministerVasopressin(doseUnits));
+        }
+
+        /// <summary>
+        /// Intravenous/oral Dopamine (多巴胺): clinical dose-staged catecholamine (t1/2 = 75s).
+        /// 10 mL IV (~1.0 unit) -> beta1 inotropy &amp; chronotropy; 20+ mL IV (2.0+ units) -> strong alpha1 vasoconstriction.
+        /// </summary>
+        public static void AdministerDopamine(Body? body, float ml, bool intravenous)
+        {
+            if (body == null || ml <= 0f) return;
+            var ctrl = GetOrCreate(body);
+            float doseUnits = ml * (intravenous ? 0.10f : 0.012f);
+            ctrl.Worker.EnqueueCommand(sim => sim.AdministerDopamine(doseUnits));
+        }
+
+        /// <summary>
+        /// Inject a mechanical CPR chest-compression arterial pulse (used by AutoPump).
+        /// </summary>
+        public static void InjectCprPulse(Body? body, float impulseMl = 26f)
+        {
+            if (body == null || impulseMl <= 0f) return;
+            var ctrl = GetOrCreate(body);
+            ctrl.Worker.EnqueueCommand(sim => sim.InjectCprPulse(impulseMl));
+        }
+
+        public static float SampleArterialPressureForMonitor(Body? body, float offsetSec, float windowSec)
+        {
+            if (body == null || !body.alive) return 0f;
+            var ctrl = GetOrCreate(body);
+            return Mathf.Clamp(
+                ctrl.Worker.SampleArterialPressurePeakPreserving(Mathf.Max(0f, offsetSec), Mathf.Max(0.002f, windowSec)),
+                0f,
+                260f);
+        }
+
+        public static void ToggleMonitorOverlay(Body? body)
+        {
+            if (body == null || !body.alive || WorldGeneration.unchipped)
+                return;
+
+            // Only show while biochip medical panel (WoundView) is open; if triggered by hotkey while closed, open WoundView first if possible
+            if (PlayerCamera.main != null && PlayerCamera.main.woundView != null && !PlayerCamera.main.woundView.activeInHierarchy)
+            {
+                if (!body.conscious) return;
+                PlayerCamera.main.woundView.SetActive(true);
+            }
+
+            PhysiologyMonitorOverlay.ToggleVisible(body);
         }
 
         public static void Defibrillate(Body? body, float energyJoules)

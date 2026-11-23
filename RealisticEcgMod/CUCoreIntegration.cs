@@ -12,7 +12,7 @@ namespace RealisticEcgMod
 {
     internal sealed class CardiacBodySaveProvider : IBodySaveProvider
     {
-        public int GetVersion() => 1;
+        public int GetVersion() => 2;
 
         public JToken Capture(Body body)
         {
@@ -30,6 +30,13 @@ namespace RealisticEcgMod
                 ["amioPool"] = snap.AmiodaronePendingPool,
                 ["lidoConc"] = snap.LidocaineConcentration,
                 ["lidoPool"] = snap.LidocainePendingPool,
+                ["nitroConc"] = snap.NitroprussideConcentration,
+                ["nitroPool"] = snap.NitroprussidePendingPool,
+                ["vasoConc"] = snap.VasopressinConcentration,
+                ["vasoPool"] = snap.VasopressinPendingPool,
+                ["dopaConc"] = snap.DopamineConcentration,
+                ["dopaPool"] = snap.DopaminePendingPool,
+                ["abp"] = snap.CurrentArterialPressureMmHg,
                 ["atp"] = snap.MyocardialAtpReserve,
                 ["rhythm"] = (int)snap.Rhythm,
                 ["hr"] = snap.HeartRateBpm
@@ -59,6 +66,13 @@ namespace RealisticEcgMod
             float amioPool = obj["amioPool"]?.Value<float>() ?? 0f;
             float lidoConc = obj["lidoConc"]?.Value<float>() ?? 0f;
             float lidoPool = obj["lidoPool"]?.Value<float>() ?? 0f;
+            float nitroConc = obj["nitroConc"]?.Value<float>() ?? 0f;
+            float nitroPool = obj["nitroPool"]?.Value<float>() ?? 0f;
+            float vasoConc = obj["vasoConc"]?.Value<float>() ?? 0f;
+            float vasoPool = obj["vasoPool"]?.Value<float>() ?? 0f;
+            float dopaConc = obj["dopaConc"]?.Value<float>() ?? 0f;
+            float dopaPool = obj["dopaPool"]?.Value<float>() ?? 0f;
+            float abp = obj["abp"]?.Value<float>() ?? Mathf.Clamp(body.bloodPressure * (93.333f / 120f), 10f, 220f);
             float atp = obj["atp"]?.Value<float>() ?? 1f;
             int rhythmInt = obj["rhythm"]?.Value<int>() ?? (int)RhythmType.NormalSinus;
             RhythmType rhythm = Enum.IsDefined(typeof(RhythmType), rhythmInt)
@@ -66,7 +80,13 @@ namespace RealisticEcgMod
                 : RhythmType.NormalSinus;
             float hr = obj["hr"]?.Value<float>() ?? 72f;
 
-            ctrl.Worker.RestoreSavedStateImmediate(amioConc, amioPool, lidoConc, lidoPool, atp, rhythm, hr);
+            ctrl.Worker.RestoreSavedStateImmediate(
+                amioConc, amioPool,
+                lidoConc, lidoPool,
+                nitroConc, nitroPool,
+                vasoConc, vasoPool,
+                dopaConc, dopaPool,
+                atp, rhythm, hr, abp);
         }
     }
 
@@ -78,14 +98,18 @@ namespace RealisticEcgMod
             RegisterModOptions();
             RegisterSaveProviders();
             RegisterLidocaineAndRecipe();
+            RegisterDopamineLiquid();
             RegisterEcgMonitorItem();
-            logger.LogInfo("CUCoreLib integrations registered (lidocaine, recipe, ecgmonitor, settings keybind, per-save persistence).");
+            logger.LogInfo("CUCoreLib integrations registered (lidocaine, dopamine, vasopressin->抗利尿激素 rename, ecgmonitor, settings keybinds, per-save persistence).");
         }
 
         private static void RegisterLocales()
         {
             LocaleRegistry.Register(LocaleRegistry.LocaleCategory.Other, "multileadEcgGuide",
                 "六导联心电图仪 — 左键调节走纸速度、增益或冻结波形测量");
+
+            // Rename vanilla vasopressin display name to 抗利尿激素 while keeping its original description untouched
+            LocaleRegistry.Register(LocaleRegistry.LocaleCategory.Liquid, "vasopressin", "抗利尿激素");
         }
 
         private static void RegisterModOptions()
@@ -99,6 +123,17 @@ namespace RealisticEcgMod
                 apply: key =>
                 {
                     CardiacModManager.MultiLeadEcgKey = key;
+                }));
+
+            ModOptionsRegistry.Register(ModOptionDefinition.Keybind(
+                id: "realisticecg.monitor_overlay_hotkey",
+                label: "实时生理曲线监护面板热键",
+                description: "在持有生物芯片时开关可拖动实时动脉压与多曲线生理监护界面（默认无快捷键，可自行绑定）。",
+                category: Setting.SettingCategory.Input,
+                defaultValue: KeyCode.None,
+                apply: key =>
+                {
+                    CardiacModManager.MonitorOverlayKey = key;
                 }));
         }
 
@@ -160,6 +195,35 @@ namespace RealisticEcgMod
                         specific = true,
                         isLiquid = true
                     }
+                }
+            });
+        }
+
+        private static void RegisterDopamineLiquid()
+        {
+            LiquidRegistry.Register("dopamine", new CustomLiquidInfo
+            {
+                name = "多巴胺",
+                description = "临床剂量分段血管活性药（半衰期约75秒）。中低剂量主要激动β1受体增强心肌收缩力与心率；高剂量显著激动α1受体强烈收缩外周血管并升高血压，过量可诱发室性异位搏动。",
+                color = new Color(0.95f, 0.88f, 0.64f, 0.90f),
+                valuePerLiter = 180f,
+                healthUsable = true,
+                injectable = true,
+                injectionSickness = 0f,
+                onHealthUse = (ml, limb) =>
+                {
+                    if (limb?.body == null) return;
+                    CardiacModManager.AdministerDopamine(limb.body, ml, intravenous: true);
+                },
+                onInject = (ml, limb) =>
+                {
+                    if (limb?.body == null) return;
+                    CardiacModManager.AdministerDopamine(limb.body, ml, intravenous: true);
+                },
+                onDrink = (ml, body) =>
+                {
+                    if (body == null) return;
+                    CardiacModManager.AdministerDopamine(body, ml, intravenous: false);
                 }
             });
         }

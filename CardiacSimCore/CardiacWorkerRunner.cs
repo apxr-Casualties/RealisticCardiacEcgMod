@@ -30,6 +30,23 @@ namespace CardiacSimCore
         public FrontalEcgSample LatestEcg;
         public long TotalStepsProcessed;
         public double LastBatchComputeMs;
+
+        // V1.1.0 real-time arterial pressure, beat-by-beat LV ejection, vascular tone & vasoactive drugs
+        public float CurrentArterialPressureMmHg;
+        public float SystolicBp5s;
+        public float DiastolicBp5s;
+        public float MeanArterialPressure5s;
+        public float InstantLvFlowMlPerSec;
+        public float LastBeatLvStrokeVolumeMl;
+        public long CompletedBeatCount;
+        public float EffectiveVascularTone;
+        public float EffectiveVesselDiameter;
+        public float NitroprussideConcentration;
+        public float NitroprussidePendingPool;
+        public float VasopressinConcentration;
+        public float VasopressinPendingPool;
+        public float DopamineConcentration;
+        public float DopaminePendingPool;
     }
 
     /// <summary>
@@ -51,6 +68,7 @@ namespace CardiacSimCore
         private readonly object _snapshotLock = new object();
         private CardiacTelemetrySnapshot _snapshot;
         private readonly FrontalEcgSample[] _sharedEcgHistory = new FrontalEcgSample[CardiacGridSimulator.RingCapacity];
+        private readonly float[] _sharedAbpHistory = new float[CardiacGridSimulator.RingCapacity];
         private int _sharedWritePos;
 
         private volatile bool _running = true;
@@ -128,6 +146,8 @@ namespace CardiacSimCore
             lock (_snapshotLock)
             {
                 Array.Clear(_sharedEcgHistory, 0, _sharedEcgHistory.Length);
+                for (int k = 0; k < _sharedAbpHistory.Length; k++)
+                    _sharedAbpHistory[k] = 92f;
                 _sharedWritePos = 0;
                 _snapshot.HeartRateBpm = targetBpm;
                 _snapshot.LeftVentricularStrokeVolumeMl = 78f;
@@ -138,12 +158,25 @@ namespace CardiacSimCore
                 _snapshot.RightVentricularEjectionFraction = 0.60f;
                 _snapshot.VentricularSynchrony = 1f;
                 _snapshot.MyocardialAtpReserve = 1f;
+                _snapshot.CurrentArterialPressureMmHg = 92f;
+                _snapshot.SystolicBp5s = 120f;
+                _snapshot.DiastolicBp5s = 80f;
+                _snapshot.MeanArterialPressure5s = 93.3f;
+                _snapshot.LastBeatLvStrokeVolumeMl = 75f;
+                _snapshot.EffectiveVascularTone = 1.0f;
+                _snapshot.EffectiveVesselDiameter = 1.0f;
                 if (clearDrugs)
                 {
                     _snapshot.AmiodaroneConcentration = 0f;
                     _snapshot.AmiodaronePendingPool = 0f;
                     _snapshot.LidocaineConcentration = 0f;
                     _snapshot.LidocainePendingPool = 0f;
+                    _snapshot.NitroprussideConcentration = 0f;
+                    _snapshot.NitroprussidePendingPool = 0f;
+                    _snapshot.VasopressinConcentration = 0f;
+                    _snapshot.VasopressinPendingPool = 0f;
+                    _snapshot.DopamineConcentration = 0f;
+                    _snapshot.DopaminePendingPool = 0f;
                 }
                 _snapshot.HasRecentPvc = false;
                 _snapshot.Rhythm = targetBpm > 100f
@@ -162,13 +195,38 @@ namespace CardiacSimCore
             RhythmType rhythm,
             float targetBpm)
         {
+            RestoreSavedStateImmediate(amioConc, amioPending, lidoConc, lidoPending, 0f, 0f, 0f, 0f, 0f, 0f, atpReserve, rhythm, targetBpm, 92f);
+        }
+
+        public void RestoreSavedStateImmediate(
+            float amioConc,
+            float amioPending,
+            float lidoConc,
+            float lidoPending,
+            float nitroConc,
+            float nitroPending,
+            float vasoConc,
+            float vasoPending,
+            float dopaConc,
+            float dopaPending,
+            float atpReserve,
+            RhythmType rhythm,
+            float targetBpm,
+            float arterialPressureMmHg)
+        {
             while (_commands.TryDequeue(out _)) { }
             lock (_timeLock)
             {
                 _pendingDeltaSec = 0f;
                 _hasPendingEnv = false;
             }
-            _commands.Enqueue(sim => sim.RestoreSavedState(amioConc, amioPending, lidoConc, lidoPending, atpReserve, rhythm, targetBpm));
+            _commands.Enqueue(sim => sim.RestoreSavedState(
+                amioConc, amioPending,
+                lidoConc, lidoPending,
+                nitroConc, nitroPending,
+                vasoConc, vasoPending,
+                dopaConc, dopaPending,
+                atpReserve, rhythm, targetBpm, arterialPressureMmHg));
             _wakeSignal.Set();
         }
 
@@ -250,6 +308,60 @@ namespace CardiacSimCore
                     }
                 }
                 return best;
+            }
+        }
+
+        /// <summary>
+        /// Non-blocking arterial pressure readout at (SimulationTimeSec - offsetSec) in mmHg.
+        /// </summary>
+        public float SampleArterialPressureAtOffset(float offsetSec)
+        {
+            lock (_snapshotLock)
+            {
+                int backSamples = ClampInt((int)Math.Round(offsetSec * CardiacGridSimulator.SampleRateHz), 0, CardiacGridSimulator.RingCapacity - 1);
+                int idx = (_sharedWritePos - 1 - backSamples + CardiacGridSimulator.RingCapacity) % CardiacGridSimulator.RingCapacity;
+                return _sharedAbpHistory[idx];
+            }
+        }
+
+        /// <summary>
+        /// Non-blocking peak-preserving arterial pressure readout over a narrow time window (mmHg).
+        /// </summary>
+        public float SampleArterialPressurePeakPreserving(float offsetSec, float windowSec)
+        {
+            lock (_snapshotLock)
+            {
+                int centerBack = ClampInt((int)Math.Round(offsetSec * CardiacGridSimulator.SampleRateHz), 0, CardiacGridSimulator.RingCapacity - 1);
+                int span = Math.Max(1, (int)Math.Round(windowSec * CardiacGridSimulator.SampleRateHz));
+                float sum = 0f;
+                float maxVal = float.MinValue;
+                float minVal = float.MaxValue;
+                for (int k = 0; k < span; k++)
+                {
+                    int b = Math.Min(CardiacGridSimulator.RingCapacity - 1, centerBack + k);
+                    int idx = (_sharedWritePos - 1 - b + CardiacGridSimulator.RingCapacity) % CardiacGridSimulator.RingCapacity;
+                    float p = _sharedAbpHistory[idx];
+                    sum += p;
+                    if (p > maxVal) maxVal = p;
+                    if (p < minVal) minVal = p;
+                }
+                float avg = sum / span;
+                return (maxVal - avg) >= (avg - minVal) ? maxVal : minVal;
+            }
+        }
+
+        public int CopyRecentAbpChronological(float[] destination, int maxCount)
+        {
+            if (destination == null || maxCount <= 0) return 0;
+            lock (_snapshotLock)
+            {
+                int count = Math.Min(maxCount, Math.Min(destination.Length, CardiacGridSimulator.RingCapacity));
+                int start = (_sharedWritePos - count + CardiacGridSimulator.RingCapacity) % CardiacGridSimulator.RingCapacity;
+                for (int k = 0; k < count; k++)
+                {
+                    destination[k] = _sharedAbpHistory[(start + k) % CardiacGridSimulator.RingCapacity];
+                }
+                return count;
             }
         }
 
@@ -335,10 +447,26 @@ namespace CardiacSimCore
                                    _simulator.CurrentRhythm != RhythmType.Asystole,
                     LatestEcg = _simulator.LatestSample,
                     TotalStepsProcessed = _totalSteps,
-                    LastBatchComputeMs = _lastBatchMs
+                    LastBatchComputeMs = _lastBatchMs,
+                    CurrentArterialPressureMmHg = _simulator.CurrentArterialPressureMmHg,
+                    SystolicBp5s = _simulator.SystolicBp5s,
+                    DiastolicBp5s = _simulator.DiastolicBp5s,
+                    MeanArterialPressure5s = _simulator.MeanArterialPressure5s,
+                    InstantLvFlowMlPerSec = _simulator.InstantLvFlowMlPerSec,
+                    LastBeatLvStrokeVolumeMl = _simulator.LastBeatLvStrokeVolumeMl,
+                    CompletedBeatCount = _simulator.CompletedBeatCount,
+                    EffectiveVascularTone = _simulator.EffectiveVascularTone,
+                    EffectiveVesselDiameter = _simulator.EffectiveVesselDiameter,
+                    NitroprussideConcentration = _simulator.NitroprussideConcentration,
+                    NitroprussidePendingPool = _simulator.NitroprussidePendingPool,
+                    VasopressinConcentration = _simulator.VasopressinConcentration,
+                    VasopressinPendingPool = _simulator.VasopressinPendingPool,
+                    DopamineConcentration = _simulator.DopamineConcentration,
+                    DopaminePendingPool = _simulator.DopaminePendingPool
                 };
 
                 _simulator.CopyRingBufferTo(_sharedEcgHistory, out _sharedWritePos);
+                _simulator.CopyAbpRingBufferTo(_sharedAbpHistory, out _);
             }
         }
 

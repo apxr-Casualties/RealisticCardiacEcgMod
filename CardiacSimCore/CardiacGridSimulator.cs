@@ -42,6 +42,18 @@ namespace CardiacSimCore
         public float LidocainePendingPool { get; private set; }
         public float LidocaineHalfLifeSec { get; set; } = 120f;  // 2 minutes game time
 
+        public float NitroprussideConcentration { get; set; }    // Potent dose-dependent arterial/venous vasodilator
+        public float NitroprussidePendingPool { get; private set; }
+        public float NitroprussideHalfLifeSec { get; set; } = 50f;
+
+        public float VasopressinConcentration { get; set; }      // ADH: pure dose-dependent V1 vasoconstrictor
+        public float VasopressinPendingPool { get; private set; }
+        public float VasopressinHalfLifeSec { get; set; } = 120f;
+
+        public float DopamineConcentration { get; set; }         // Dose-staged: beta1 inotropy/HR -> high-dose alpha1 vasoconstriction
+        public float DopaminePendingPool { get; private set; }
+        public float DopamineHalfLifeSec { get; set; } = 75f;
+
         // Defibrillation state
         private float _shockArtifactTimerSec;
         private float _shockArtifactPolarity;
@@ -68,8 +80,39 @@ namespace CardiacSimCore
         public const int SampleRateHz = 500;
         public const int RingCapacity = 6000;
         private readonly FrontalEcgSample[] _ringBuffer = new FrontalEcgSample[RingCapacity];
+        private readonly float[] _abpRingBuffer = new float[RingCapacity];
         private int _ringWritePos;
+        private int _abpValidSamples;
         private int _stepCounter;
+
+        // Real-time beat-by-beat LV ejection & Windkessel arterial hemodynamics
+        private float _lvTensionSmooth;
+        private float _prevLvTensionSmooth;
+        private float _lvTensionFloor;
+        private float _lvDiastolicFillFrac = 1.0f;
+        private float _beatStartFillFrac = 1.0f;
+        private bool _lvValveOpen;
+        private float _currentBeatEjectedMl;
+        private float _dicroticTimerSec;
+        private float _cprPulseElapsedSec;
+        private float _cprPulseDurationSec;
+        private float _cprPulseTotalMl;
+        private float _arterialPressureMmHg = 92f;
+        private float _systolicBp5s = 120f;
+        private float _diastolicBp5s = 80f;
+        private float _map5s = 93.3f;
+        private float _effectiveVascularTone = 1.0f;
+        private float _effectiveVesselDiameter = 1.0f;
+
+        public float InstantLvFlowMlPerSec { get; private set; }
+        public float LastBeatLvStrokeVolumeMl { get; private set; } = 75f;
+        public long CompletedBeatCount { get; private set; }
+        public float CurrentArterialPressureMmHg => _arterialPressureMmHg;
+        public float SystolicBp5s => _systolicBp5s;
+        public float DiastolicBp5s => _diastolicBp5s;
+        public float MeanArterialPressure5s => _map5s;
+        public float EffectiveVascularTone => _effectiveVascularTone;
+        public float EffectiveVesselDiameter => _effectiveVesselDiameter;
 
         // Mechanical ejection & beat metrics
         private float _lvTensionSysPeak;
@@ -171,6 +214,12 @@ namespace CardiacSimCore
                 AmiodaronePendingPool = 0f;
                 LidocaineConcentration = 0f;
                 LidocainePendingPool = 0f;
+                NitroprussideConcentration = 0f;
+                NitroprussidePendingPool = 0f;
+                VasopressinConcentration = 0f;
+                VasopressinPendingPool = 0f;
+                DopamineConcentration = 0f;
+                DopaminePendingPool = 0f;
             }
 
             if (resetEnvironment)
@@ -220,7 +269,30 @@ namespace CardiacSimCore
             _vtAutoRevertTimerSec = 0f;
 
             Array.Clear(_ringBuffer, 0, RingCapacity);
+            for (int k = 0; k < RingCapacity; k++)
+                _abpRingBuffer[k] = 92f;
             _ringWritePos = 0;
+            _abpValidSamples = 0;
+
+            _lvTensionSmooth = 0f;
+            _prevLvTensionSmooth = 0f;
+            _lvTensionFloor = 0f;
+            _lvDiastolicFillFrac = 1.0f;
+            _beatStartFillFrac = 1.0f;
+            _lvValveOpen = false;
+            _currentBeatEjectedMl = 0f;
+            _dicroticTimerSec = 0f;
+            _cprPulseElapsedSec = 0f;
+            _cprPulseDurationSec = 0f;
+            _cprPulseTotalMl = 0f;
+            _arterialPressureMmHg = 92f;
+            _systolicBp5s = 120f;
+            _diastolicBp5s = 80f;
+            _map5s = 93.3f;
+            _effectiveVascularTone = 1.0f;
+            _effectiveVesselDiameter = 1.0f;
+            InstantLvFlowMlPerSec = 0f;
+            LastBeatLvStrokeVolumeMl = 75f;
 
             _lvStrokeVolumeMl = 75f;
             _rvStrokeVolumeMl = 75f;
@@ -256,6 +328,50 @@ namespace CardiacSimCore
         }
 
         /// <summary>
+        /// Administer intravenous Sodium Nitroprusside (rapid dose-dependent vasodilator, t1/2 ~ 50s).
+        /// Standard 20 mL bolus = 2.0 dose units.
+        /// </summary>
+        public void AdministerNitroprusside(float doseUnits)
+        {
+            if (doseUnits <= 0f) return;
+            NitroprussidePendingPool += doseUnits;
+        }
+
+        /// <summary>
+        /// Administer intravenous Vasopressin / ADH (pure dose-dependent V1 vasoconstrictor, t1/2 ~ 120s).
+        /// Standard 20 mL bolus = 2.0 dose units.
+        /// </summary>
+        public void AdministerVasopressin(float doseUnits)
+        {
+            if (doseUnits <= 0f) return;
+            VasopressinPendingPool += doseUnits;
+        }
+
+        /// <summary>
+        /// Administer intravenous Dopamine (dose-staged: low/mod beta1 inotropy &amp; HR -> high alpha1 vasoconstriction, t1/2 ~ 75s).
+        /// Standard 10 mL = 1.0 unit (beta1), 20+ mL = 2.0+ units (beta1 + strong alpha1 pressor).
+        /// </summary>
+        public void AdministerDopamine(float doseUnits)
+        {
+            if (doseUnits <= 0f) return;
+            DopaminePendingPool += doseUnits;
+        }
+
+        /// <summary>
+        /// Inject a mechanical CPR chest-compression arterial pulse (e.g. AutoPump every 0.3s).
+        /// </summary>
+        public void InjectCprPulse(float impulseMl = 26f)
+        {
+            if (impulseMl <= 0f) return;
+            _cprPulseElapsedSec = 0f;
+            _cprPulseDurationSec = 0.13f;
+            _cprPulseTotalMl = Clamp(impulseMl, 6f, 90f);
+        }
+
+        public float GetInstantaneousLvEjectionFlowMlPerSec() => InstantLvFlowMlPerSec;
+        public float GetLastBeatLvStrokeVolumeMl() => LastBeatLvStrokeVolumeMl;
+
+        /// <summary>
         /// Restore persisted pharmacology, ATP reserve, and rhythm state when loading a save.
         /// </summary>
         public void RestoreSavedState(
@@ -267,12 +383,44 @@ namespace CardiacSimCore
             RhythmType rhythm,
             float targetBpm)
         {
+            RestoreSavedState(amioConc, amioPending, lidoConc, lidoPending, 0f, 0f, 0f, 0f, 0f, 0f, atpReserve, rhythm, targetBpm, 95f);
+        }
+
+        public void RestoreSavedState(
+            float amioConc,
+            float amioPending,
+            float lidoConc,
+            float lidoPending,
+            float nitroConc,
+            float nitroPending,
+            float vasoConc,
+            float vasoPending,
+            float dopaConc,
+            float dopaPending,
+            float atpReserve,
+            RhythmType rhythm,
+            float targetBpm,
+            float arterialPressureMmHg)
+        {
             ResetToSinus(clearDrugs: true, resetEnvironment: false, targetBpm: Clamp(targetBpm, 35f, 200f));
             AmiodaroneConcentration = Math.Max(0f, amioConc);
             AmiodaronePendingPool = Math.Max(0f, amioPending);
             LidocaineConcentration = Math.Max(0f, lidoConc);
             LidocainePendingPool = Math.Max(0f, lidoPending);
+            NitroprussideConcentration = Math.Max(0f, nitroConc);
+            NitroprussidePendingPool = Math.Max(0f, nitroPending);
+            VasopressinConcentration = Math.Max(0f, vasoConc);
+            VasopressinPendingPool = Math.Max(0f, vasoPending);
+            DopamineConcentration = Math.Max(0f, dopaConc);
+            DopaminePendingPool = Math.Max(0f, dopaPending);
             MyocardialAtpReserve = Clamp(atpReserve, 0f, 1f);
+            _arterialPressureMmHg = Clamp(arterialPressureMmHg, 0f, 250f);
+            for (int k = 0; k < RingCapacity; k++)
+                _abpRingBuffer[k] = _arterialPressureMmHg;
+            _abpValidSamples = 1;
+            _systolicBp5s = _arterialPressureMmHg;
+            _diastolicBp5s = _arterialPressureMmHg;
+            _map5s = _arterialPressureMmHg;
 
             if (rhythm == RhythmType.Asystole || MyocardialAtpReserve <= 0.02f)
             {
@@ -604,19 +752,22 @@ namespace CardiacSimCore
             // 2. Compute global modulators
             float amio = Clamp(AmiodaroneConcentration, 0f, 4f);
             float lido = Clamp(LidocaineConcentration, 0f, 8f);
+            float dopa = Math.Max(0f, DopamineConcentration);
+            float dopaBeta1 = Clamp(dopa * 0.50f, 0f, 1.15f);
+            float dopaEctopy = Clamp((dopa - 2.4f) * 0.22f, 0f, 0.55f);
             float tempFactor = Clamp(1f + (37f - Environment.TemperatureC) * 0.045f, 0.75f, 1.8f); // Hypothermia slows conduction & prolongs APD
             float adren = Math.Max(0f, Environment.Adrenaline); // Uncapped total adrenaline (1.0 = max endogenous 100)
-            float caOverload = Clamp((adren - 1.0f) * 0.35f, 0f, 0.85f);
+            float caOverload = Clamp((adren - 1.0f) * 0.35f + dopaEctopy * 0.65f, 0f, 0.85f);
 
-            // Amiodarone slows SA rate slightly; uncapped total adrenaline accelerates SA rate
-            float adrenRateMult = 1f + 0.40f * Math.Min(adren, 1.5f) + 0.16f * Math.Max(0f, Math.Min(adren, 4.0f) - 1.5f);
+            // Amiodarone slows SA rate slightly; uncapped total adrenaline + Dopamine beta1 accelerate SA rate
+            float adrenRateMult = 1f + 0.40f * Math.Min(adren, 1.5f) + 0.16f * Math.Max(0f, Math.Min(adren, 4.0f) - 1.5f) + 0.24f * dopaBeta1;
             float effectiveSaBpm = Environment.TargetSinusBpm * adrenRateMult * (1f - 0.14f * Clamp(amio / 2f, 0f, 1.5f)) / tempFactor;
             effectiveSaBpm = Clamp(effectiveSaBpm, 0f, 235f);
 
             float amioApdMult = 1f + 0.24f * amio;
             float amioAvSlowMult = 1f / (1f + 0.22f * amio);
-            float avAdrenConductionMult = 1f + 0.55f * (float)Math.Tanh(adren * 0.85);
-            float adrenConductionMult = 1f + 0.32f * (float)Math.Tanh(adren * 0.75);
+            float avAdrenConductionMult = 1f + 0.55f * (float)Math.Tanh((adren + 0.35f * dopaBeta1) * 0.85);
+            float adrenConductionMult = 1f + 0.32f * (float)Math.Tanh((adren + 0.25f * dopaBeta1) * 0.75);
             float rateApdAdapt = Clamp((float)Math.Sqrt(72f / Math.Max(45f, MeasuredHeartRateBpm)), 0.70f, 1.15f);
 
             // 3. Myocardial ATP reserve & VF -> Fine VF -> Asystole AND CPR (BP > 60 && SpO2 > 50) -> Asystole -> Fine VF -> Coarse VF
@@ -1063,7 +1214,8 @@ namespace CardiacSimCore
             _lvInstantTension = lvTensionSum / Math.Max(1, Anatomy.LvCells.Length);
             _rvInstantTension = rvTensionSum / Math.Max(1, Anatomy.RvCells.Length);
 
-            // 6. Compute dipole projection -> Frontal ECG leads + monitor filter + R-peak / ejection updates
+            // 6. Real-time beat-by-beat LV ejection + Windkessel arterial hemodynamics -> ECG dipole & metrics
+            UpdateArterialHemodynamics(adren, dopa, dopaBeta1);
             UpdateDipoleAndEcg();
             UpdateMechanicalEjection();
         }
@@ -1222,6 +1374,197 @@ namespace CardiacSimCore
                 double k = Math.Log(2.0) / LidocaineHalfLifeSec;
                 LidocaineConcentration *= (float)Math.Exp(-k * StepSec);
             }
+
+            // Sodium Nitroprusside: ultra-rapid onset IV vasodilator (tau ~ 1.8s, t1/2 = 50s)
+            if (NitroprussidePendingPool > 0.0001f)
+            {
+                float absorbed = NitroprussidePendingPool * (StepSec / 1.8f);
+                NitroprussidePendingPool -= absorbed;
+                NitroprussideConcentration += absorbed;
+            }
+            if (NitroprussideConcentration > 0f && NitroprussideHalfLifeSec > 0.1f)
+            {
+                double k = Math.Log(2.0) / NitroprussideHalfLifeSec;
+                NitroprussideConcentration *= (float)Math.Exp(-k * StepSec);
+            }
+
+            // Vasopressin (ADH): pure dose-dependent V1 vasoconstrictor (tau ~ 2.8s, t1/2 = 120s)
+            if (VasopressinPendingPool > 0.0001f)
+            {
+                float absorbed = VasopressinPendingPool * (StepSec / 2.8f);
+                VasopressinPendingPool -= absorbed;
+                VasopressinConcentration += absorbed;
+            }
+            if (VasopressinConcentration > 0f && VasopressinHalfLifeSec > 0.1f)
+            {
+                double k = Math.Log(2.0) / VasopressinHalfLifeSec;
+                VasopressinConcentration *= (float)Math.Exp(-k * StepSec);
+            }
+
+            // Dopamine: dose-staged catecholamine (tau ~ 2.4s, t1/2 = 75s)
+            if (DopaminePendingPool > 0.0001f)
+            {
+                float absorbed = DopaminePendingPool * (StepSec / 2.4f);
+                DopaminePendingPool -= absorbed;
+                DopamineConcentration += absorbed;
+            }
+            if (DopamineConcentration > 0f && DopamineHalfLifeSec > 0.1f)
+            {
+                double k = Math.Log(2.0) / DopamineHalfLifeSec;
+                DopamineConcentration *= (float)Math.Exp(-k * StepSec);
+            }
+        }
+
+        private void UpdateArterialHemodynamics(float adren, float dopa, float dopaBeta1)
+        {
+            // Smooth instantaneous LV calcium tension (tau ~ 12 ms)
+            _prevLvTensionSmooth = _lvTensionSmooth;
+            _lvTensionSmooth += (_lvInstantTension - _lvTensionSmooth) * 0.082f;
+
+            // Slow diastolic baseline tracker: drops swiftly when tension relaxes, drifts up slowly during sustained VF tonicity
+            if (_lvTensionSmooth < _lvTensionFloor)
+                _lvTensionFloor += (_lvTensionSmooth - _lvTensionFloor) * 0.055f;
+            else
+                _lvTensionFloor += (_lvTensionSmooth - _lvTensionFloor) * (StepSec / 1.35f);
+
+            float floorWeight = CurrentRhythm == RhythmType.VentricularFibrillation ? 1.0f : 0.30f;
+            float activeTension = Math.Max(0f, _lvTensionSmooth - floorWeight * _lvTensionFloor);
+            float dTensionDt = (_lvTensionSmooth - _prevLvTensionSmooth) / StepSec;
+
+            // 1. Effective vascular tone & vessel diameter (combining environment + direct peripheral vasoactive drugs)
+            float baseTone = Clamp(Environment.VascularTone > 0.01f ? Environment.VascularTone : 1.0f, 0.20f, 3.60f);
+            float baseDiam = Clamp(Environment.VesselDiameter > 0.01f ? Environment.VesselDiameter : 1.0f, 0.50f, 1.80f);
+            float viscosity = Clamp(Environment.BloodViscosityFactor > 0.01f ? Environment.BloodViscosityFactor : 1.0f, 0.45f, 2.20f);
+            float preload = Clamp(Environment.PreloadFactor, 0.02f, 1.35f);
+            float venousReturn = Clamp(Environment.VenousReturnFactor > 0.01f ? Environment.VenousReturnFactor : 1.0f, 0.25f, 1.45f);
+
+            // When an external autonomic mod (e.g. NeurologyOverhaulMod) drives body.bloodVesselSize,
+            // avoid double-applying endogenous sympathetic vasoconstriction; only add exogenous adrenaline excess.
+            float adrenAlpha = Environment.ExternalAutonomicControl
+                ? Math.Max(0f, adren - 0.65f)
+                : adren;
+            float adrenToneBoost = 0.48f * (float)Math.Tanh(adrenAlpha * 0.65) + 0.45f * Math.Max(0f, adrenAlpha - 1.0f);
+
+            // Clinical dose-staged Dopamine:
+            // - Low/moderate (< 1.0): predominantly beta1 inotropy & chronotropy with mild tone support
+            // - High (> 1.0): strong alpha1 vasoconstriction
+            float dopaAlpha = Math.Max(0f, dopa - 1.0f);
+            float dopaToneBoost = 0.08f * Clamp(dopa, 0f, 1.0f) + 0.65f * (float)Math.Tanh(dopaAlpha * 0.55);
+
+            // Vasopressin (ADH): pure dose-dependent V1 vasoconstriction (no direct chronotropic effect)
+            float vaso = Math.Max(0f, VasopressinConcentration);
+            float vasoToneBoost = 0.95f * (float)Math.Tanh(vaso * 0.48) + 0.12f * Math.Max(0f, vaso - 2.0f);
+
+            // Sodium Nitroprusside: potent dose-dependent arterial + venous vasodilation
+            float nitro = Math.Max(0f, NitroprussideConcentration);
+            float nitroDilator = 1f / (1f + 0.80f * nitro);
+            float nitroVenous = 1f / (1f + 0.22f * nitro);
+
+            float constrictMult = 1f + adrenToneBoost + dopaToneBoost + vasoToneBoost;
+            float effTone = Clamp(baseTone * constrictMult * nitroDilator, 0.18f, 3.80f);
+            float drugDiamFactor = Clamp((float)Math.Pow(1.0 / Math.Max(0.22, constrictMult * nitroDilator), 0.18), 0.66f, 1.48f);
+            float effDiam = Clamp(baseDiam * drugDiamFactor, 0.55f, 1.68f);
+
+            _effectiveVascularTone = effTone;
+            _effectiveVesselDiameter = effDiam;
+
+            // 2. Diastolic ventricular filling (shorter diastole during PVC/VT -> naturally smaller stroke volume!)
+            float fillTarget = Clamp(preload * venousReturn * nitroVenous, 0.04f, 1.40f);
+            if (!_lvValveOpen)
+            {
+                _lvDiastolicFillFrac += (fillTarget - _lvDiastolicFillFrac) * (StepSec / 0.185f);
+            }
+
+            // 3. Beat-by-beat LV pressure & aortic valve ejection Q_LV(t)
+            float atpContractility = Clamp(0.22f + 0.78f * MyocardialAtpReserve, 0.05f, 1.0f);
+            float inotropy = (1f + 0.78f * (float)Math.Tanh(adren * 0.75) + 0.34f * dopaBeta1) * atpContractility;
+            float syncFactor = CurrentRhythm == RhythmType.Asystole
+                ? 0f
+                : (CurrentRhythm == RhythmType.VentricularFibrillation
+                    ? 0.05f
+                    : Clamp(0.22f + 0.78f * VentricularSynchrony, 0.15f, 1.0f));
+
+            // Frank-Starling contractile force is set by End-Diastolic Filling at beat onset
+            float effectiveFillForForce = _lvValveOpen ? _beatStartFillFrac : _lvDiastolicFillFrac;
+            float pLv = 6f + 265f * activeTension * (0.38f + 0.62f * effectiveFillForForce) * inotropy * syncFactor;
+
+            float qLv = 0f;
+            if (pLv > _arterialPressureMmHg && _lvDiastolicFillFrac > 0.16f && activeTension > 0.05f)
+            {
+                if (!_lvValveOpen)
+                {
+                    _lvValveOpen = true;
+                    _beatStartFillFrac = _lvDiastolicFillFrac;
+                }
+                qLv = Clamp((pLv - _arterialPressureMmHg) / 0.115f, 0f, 880f);
+                float ejectedMl = qLv * StepSec;
+                _currentBeatEjectedMl += ejectedMl;
+                // Deplete ventricular volume toward residual ESV (~16% floor)
+                _lvDiastolicFillFrac = Math.Max(0.12f, _lvDiastolicFillFrac - ejectedMl / 96f);
+            }
+            else if (_lvValveOpen && (pLv <= _arterialPressureMmHg || _lvDiastolicFillFrac <= 0.16f || dTensionDt < -2.0f))
+            {
+                if (_currentBeatEjectedMl >= 4f)
+                {
+                    LastBeatLvStrokeVolumeMl = _currentBeatEjectedMl;
+                    CompletedBeatCount++;
+                    _dicroticTimerSec = 0.055f;
+                }
+                _lvValveOpen = false;
+                _currentBeatEjectedMl = 0f;
+            }
+            InstantLvFlowMlPerSec = qLv;
+
+            // 4. Dicrotic notch aortic valve closure transient (nearly zero net volume)
+            float qDicrotic = 0f;
+            if (_dicroticTimerSec > 0f)
+            {
+                _dicroticTimerSec = Math.Max(0f, _dicroticTimerSec - StepSec);
+                qDicrotic = _dicroticTimerSec > 0.035f ? -26f : 18f;
+            }
+
+            // 5. Mechanical CPR chest-compression pulse (AutoPump)
+            float qCpr = 0f;
+            if (_cprPulseDurationSec > 0f && _cprPulseElapsedSec < _cprPulseDurationSec)
+            {
+                float phase = _cprPulseElapsedSec / _cprPulseDurationSec;
+                float effectiveCprVol = _cprPulseTotalMl * Clamp(preload, 0.12f, 1.15f);
+                // Half-sine integral over [0, D] equals effectiveCprVol
+                qCpr = (float)(Math.PI / (2.0 * _cprPulseDurationSec) * effectiveCprVol * Math.Sin(Math.PI * phase));
+                _cprPulseElapsedSec += StepSec;
+            }
+
+            // 6. 2-element Windkessel ODE integration
+            // Baseline calibrated so 72 bpm, SV ~ 75 mL, tone = 1, diam = 1 yields ~120/80 mmHg (MAP ~ 93 mmHg)
+            float baseDiamRes = 1f / (baseDiam * baseDiam);
+            float svr = Clamp(0.91f * effTone * baseDiamRes * viscosity, 0.20f, 4.80f);
+            float wallStiffFactor = Clamp(1f - Math.Max(0f, _arterialPressureMmHg - 115f) / 360f, 0.50f, 1.0f);
+            float compliance = Clamp((1.62f / (0.65f + 0.35f * effTone)) * wallStiffFactor, 0.42f, 2.45f);
+            float pVenous = Clamp(8.0f * fillTarget, 2.0f, 14.0f);
+
+            float qOut = (_arterialPressureMmHg - pVenous) / svr;
+            float dPdt = (qLv + qCpr + qDicrotic - qOut) / compliance;
+            _arterialPressureMmHg = Clamp(_arterialPressureMmHg + dPdt * StepSec, 0f, 290f);
+
+            // 7. Rolling 5-second max (SBP), min (DBP), and mean (MAP) updated every 50 ms
+            if ((_stepCounter % 50) == 0 && _abpValidSamples > 0)
+            {
+                int windowSamples = Math.Min(2500, Math.Min(_abpValidSamples, RingCapacity));
+                float maxP = float.MinValue;
+                float minP = float.MaxValue;
+                double sumP = 0.0;
+                for (int k = 0; k < windowSamples; k++)
+                {
+                    int idx = (_ringWritePos - 1 - k + RingCapacity) % RingCapacity;
+                    float p = _abpRingBuffer[idx];
+                    if (p > maxP) maxP = p;
+                    if (p < minP) minP = p;
+                    sumP += p;
+                }
+                _systolicBp5s = maxP;
+                _diastolicBp5s = minP;
+                _map5s = (float)(sumP / windowSamples);
+            }
         }
 
         private void UpdateDipoleAndEcg()
@@ -1322,11 +1665,13 @@ namespace CardiacSimCore
             var sample = new FrontalEcgSample(SimulationTimeSec, outI, outII);
             LatestSample = sample;
 
-            // Downsample 1000 Hz -> 500 Hz into ring buffer
+            // Downsample 1000 Hz -> 500 Hz into ring buffer (synchronized ECG + arterial pressure)
             if ((_stepCounter & 1) == 0)
             {
                 _ringBuffer[_ringWritePos] = sample;
+                _abpRingBuffer[_ringWritePos] = _arterialPressureMmHg;
                 _ringWritePos = (_ringWritePos + 1) % RingCapacity;
+                if (_abpValidSamples < RingCapacity) _abpValidSamples++;
             }
         }
 
@@ -1403,7 +1748,8 @@ namespace CardiacSimCore
                 float hr = MeasuredHeartRateBpm;
                 float fillingEff = hr <= 130f ? 1f : Clamp(1f - (hr - 130f) / 180f, 0.25f, 1f);
                 float adrenTotal = Math.Max(0f, Environment.Adrenaline);
-                float adrenInotropy = 1f + 0.28f * (float)Math.Tanh(adrenTotal * 1.1);
+                float dopaBeta1 = Clamp(DopamineConcentration * 0.50f, 0f, 1.15f);
+                float adrenInotropy = 1f + 0.28f * (float)Math.Tanh(adrenTotal * 1.1) + 0.26f * dopaBeta1;
 
                 float targetLvSv = 70f * lvPulse * VentricularSynchrony * preload * fillingEff * adrenInotropy;
                 float targetRvSv = 70f * rvPulse * VentricularSynchrony * preload * fillingEff * adrenInotropy;
@@ -1457,6 +1803,40 @@ namespace CardiacSimCore
         {
             Array.Copy(_ringBuffer, destination, RingCapacity);
             writePos = _ringWritePos;
+        }
+
+        internal void CopyAbpRingBufferTo(float[] destination, out int writePos)
+        {
+            Array.Copy(_abpRingBuffer, destination, RingCapacity);
+            writePos = _ringWritePos;
+        }
+
+        public float SampleArterialPressureAtOffset(float offsetSec)
+        {
+            int backSamples = ClampInt((int)Math.Round(offsetSec * SampleRateHz), 0, RingCapacity - 1);
+            int idx = (_ringWritePos - 1 - backSamples + RingCapacity) % RingCapacity;
+            return _abpRingBuffer[idx];
+        }
+
+        public float SampleArterialPressurePeakPreserving(float offsetSec, float windowSec)
+        {
+            int centerBack = ClampInt((int)Math.Round(offsetSec * SampleRateHz), 0, RingCapacity - 1);
+            int span = Math.Max(1, (int)Math.Round(windowSec * SampleRateHz));
+            float sum = 0f;
+            float maxVal = float.MinValue;
+            float minVal = float.MaxValue;
+            for (int k = 0; k < span; k++)
+            {
+                int b = Math.Min(RingCapacity - 1, centerBack + k);
+                int idx = (_ringWritePos - 1 - b + RingCapacity) % RingCapacity;
+                float p = _abpRingBuffer[idx];
+                sum += p;
+                if (p > maxVal) maxVal = p;
+                if (p < minVal) minVal = p;
+            }
+            float avg = sum / span;
+            // Preserve crisp systolic peaks or steep dicrotic dips within narrow pixel windows
+            return (maxVal - avg) >= (avg - minVal) ? maxVal : minVal;
         }
 
         /// <summary>

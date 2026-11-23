@@ -112,6 +112,21 @@ namespace CardiacSimCore
         /// <summary>True when arterial perfusion and oxygenation (BP > 60 and SpO2 > 50, e.g. AutoPump CPR) support myocardial ATP recovery.</summary>
         public bool AllowAtpRecovery;
 
+        /// <summary>Baseline systemic vascular wall tone [0.35..2.40], 1.0 = normal tone (higher = stiffer/constricted, lower = vasoplegic).</summary>
+        public float VascularTone;
+
+        /// <summary>Baseline systemic resistance vessel diameter [0.55..1.65], 1.0 = normal (&lt;1 = constricted, &gt;1 = dilated; maps Body.bloodVesselSize).</summary>
+        public float VesselDiameter;
+
+        /// <summary>Blood viscosity multiplier [0.65..1.65], 1.0 = normal viscosity.</summary>
+        public float BloodViscosityFactor;
+
+        /// <summary>Venous return / systemic filling pressure multiplier [0.15..1.35], 1.0 = normal.</summary>
+        public float VenousReturnFactor;
+
+        /// <summary>True when an external autonomic nervous system mod (e.g. NeurologyOverhaulMod) already drives VesselDiameter via Body.bloodVesselSize.</summary>
+        public bool ExternalAutonomicControl;
+
         public static CardiacEnvironmentInput Normal() => new CardiacEnvironmentInput
         {
             TargetSinusBpm = 72f,
@@ -122,7 +137,12 @@ namespace CardiacSimCore
             PreloadFactor = 1.0f,
             TemperatureC = 37.0f,
             Adrenaline = 0.0f,
-            AllowAtpRecovery = false
+            AllowAtpRecovery = false,
+            VascularTone = 1.0f,
+            VesselDiameter = 1.0f,
+            BloodViscosityFactor = 1.0f,
+            VenousReturnFactor = 1.0f,
+            ExternalAutonomicControl = false
         };
     }
 }
