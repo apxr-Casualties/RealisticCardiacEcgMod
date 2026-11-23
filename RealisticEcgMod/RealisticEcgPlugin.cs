@@ -21,6 +21,7 @@ namespace RealisticEcgMod
         private ConfigEntry<FrontalLead>? _defaultLeadConfig;
         private ConfigEntry<float>? _monitorPosXConfig;
         private ConfigEntry<float>? _monitorPosYConfig;
+        private ConfigEntry<bool>? _monitorEnabledConfig;
 
         private void Awake()
         {
@@ -43,6 +44,12 @@ namespace RealisticEcgMod
                 "WindowPosY",
                 -90f,
                 "Saved vertical anchored position of the draggable real-time physiology monitor window.");
+
+            _monitorEnabledConfig = Config.Bind(
+                "MonitorOverlay",
+                "WindowEnabled",
+                false,
+                "Whether the real-time physiology monitor overlay automatically opens whenever the biochip medical panel is opened.");
 
             CardiacModManager.DefaultLead = _defaultLeadConfig.Value;
             _defaultLeadConfig.SettingChanged += (_, _) =>
@@ -76,6 +83,19 @@ namespace RealisticEcgMod
             if (Instance?._monitorPosXConfig == null || Instance._monitorPosYConfig == null) return;
             Instance._monitorPosXConfig.Value = anchoredPosition.x;
             Instance._monitorPosYConfig.Value = anchoredPosition.y;
+            Instance.Config.Save();
+        }
+
+        internal static bool GetSavedMonitorOverlayEnabled()
+        {
+            return Instance?._monitorEnabledConfig != null && Instance._monitorEnabledConfig.Value;
+        }
+
+        internal static void SaveMonitorOverlayEnabled(bool enabled)
+        {
+            if (Instance?._monitorEnabledConfig == null) return;
+            if (Instance._monitorEnabledConfig.Value == enabled) return;
+            Instance._monitorEnabledConfig.Value = enabled;
             Instance.Config.Save();
         }
 

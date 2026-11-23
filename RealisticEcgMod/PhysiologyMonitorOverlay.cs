@@ -241,9 +241,11 @@ namespace RealisticEcgMod
         {
             if (TargetWindow == null || BoundsRect == null) return pos;
             Rect parentRect = BoundsRect.rect;
+            if (parentRect.width < 100f || parentRect.height < 100f) return pos;
             Vector2 size = TargetWindow.rect.size;
+            if (size.x <= 1f || size.y <= 1f) size = TargetWindow.sizeDelta;
 
-            // Window uses anchor (1, 1), pivot (1, 1) so anchoredPosition (0, 0) is top-right corner
+            // Window uses anchor (1, 1), pivot (1, 1) inside full-screen BoundsRect -> (0, 0) is top-right of screen
             float minX = -(parentRect.width - size.x - 8f);
             float maxX = -8f;
             float minY = -(parentRect.height - size.y - 8f);
@@ -311,28 +313,71 @@ namespace RealisticEcgMod
             var inst = EnsureInstance();
             if (inst == null) return;
 
-            if (inst._isOpen)
+            bool targetEnabled = !inst._isOpen;
+            RealisticEcgPlugin.SaveMonitorOverlayEnabled(targetEnabled);
+
+            if (targetEnabled)
             {
-                inst.CloseInternal();
+                inst.OpenInternal(body, playSound: true);
             }
             else
             {
-                inst.OpenInternal(body);
+                inst.HideInternal();
+                if (PlayerCamera.main != null)
+                    PlayerCamera.main.PlayUISound(PlayerCamera.UISoundType.MiniClick, 0.95f);
+            }
+        }
+
+        public static void SetEnabledAndShow(Body body, bool enabled)
+        {
+            if (body == null || !body.alive || WorldGeneration.unchipped)
+                return;
+
+            RealisticEcgPlugin.SaveMonitorOverlayEnabled(enabled);
+
+            if (enabled)
+            {
+                var inst = EnsureInstance();
+                inst?.OpenInternal(body, playSound: true);
+            }
+            else
+            {
+                _instance?.HideInternal();
             }
         }
 
         public static void SyncWithWoundView(WoundView? view)
         {
-            if (_instance == null || !_instance._isOpen) return;
-
+            Body? targetBody = view != null ? view.body : null;
             bool woundViewOpen = view != null && view.gameObject.activeInHierarchy;
-            if (!woundViewOpen || WorldGeneration.unchipped || view!.body == null || !view.body.alive)
+            if (!woundViewOpen || WorldGeneration.unchipped || targetBody == null || !targetBody.alive)
             {
-                _instance.CloseInternal();
+                // Temporarily hide without overwriting saved WindowEnabled preference
+                if (_instance != null && _instance._isOpen)
+                {
+                    _instance.HideInternal();
+                }
+                return;
             }
-            else
+
+            bool savedEnabled = RealisticEcgPlugin.GetSavedMonitorOverlayEnabled();
+            if (savedEnabled)
             {
-                _instance._targetBody = view.body;
+                var inst = EnsureInstance();
+                if (inst == null) return;
+                inst._targetBody = targetBody;
+                if (!inst._isOpen)
+                {
+                    inst.OpenInternal(targetBody, playSound: false);
+                }
+            }
+            else if (_instance != null)
+            {
+                _instance._targetBody = targetBody;
+                if (_instance._isOpen)
+                {
+                    _instance.HideInternal();
+                }
             }
         }
 
@@ -361,10 +406,18 @@ namespace RealisticEcgMod
             if (targetCanvas == null)
                 return null;
 
-            var hostGo = new GameObject("PhysiologyMonitorOverlayHost");
+            // Stretch host RectTransform across the entire Canvas (0,0 -> 1,1) so the floating window can drag freely across the full screen
+            var hostGo = new GameObject("PhysiologyMonitorOverlayHost", typeof(RectTransform));
             hostGo.transform.SetParent(targetCanvas.transform, false);
+            var hostRt = hostGo.GetComponent<RectTransform>();
+            hostRt.anchorMin = Vector2.zero;
+            hostRt.anchorMax = Vector2.one;
+            hostRt.offsetMin = Vector2.zero;
+            hostRt.offsetMax = Vector2.zero;
+            LayoutRebuilder.ForceRebuildLayoutImmediate(hostRt);
+
             var host = hostGo.AddComponent<PhysiologyMonitorOverlay>();
-            host._canvasRect = targetCanvas.GetComponent<RectTransform>();
+            host._canvasRect = hostRt;
             host._sharedFont = ResolveFont();
             host.BuildWindowUi();
             PhysiologyMonitorApi.OnCurvesChanged += host.MarkLayoutDirty;
@@ -399,29 +452,42 @@ namespace RealisticEcgMod
             _layoutDirty = true;
         }
 
-        private void OpenInternal(Body body)
+        private void OpenInternal(Body body, bool playSound)
         {
             _targetBody = body;
             _isOpen = true;
             _layoutDirty = true;
+            transform.SetAsLastSibling();
             if (_windowGo != null)
             {
                 _windowGo.SetActive(true);
                 _windowGo.transform.SetAsLastSibling();
             }
             RebuildChannelsIfNeeded();
+            if (_windowRect != null && _dragHandle != null)
+            {
+                _windowRect.anchoredPosition = _dragHandle.ClampToParent(RealisticEcgPlugin.GetSavedMonitorOverlayPosition());
+            }
             ResetAllSweepHeads();
-            if (PlayerCamera.main != null)
+            if (playSound && PlayerCamera.main != null)
                 PlayerCamera.main.PlayUISound(PlayerCamera.UISoundType.MiniClick, 1.05f);
         }
 
-        private void CloseInternal()
+        private void HideInternal()
         {
             _isOpen = false;
             if (_windowGo != null)
             {
                 _windowGo.SetActive(false);
             }
+        }
+
+        private void UserCloseButtonClicked()
+        {
+            RealisticEcgPlugin.SaveMonitorOverlayEnabled(false);
+            HideInternal();
+            if (PlayerCamera.main != null)
+                PlayerCamera.main.PlayUISound(PlayerCamera.UISoundType.MiniClick, 0.95f);
         }
 
         private void BuildWindowUi()
@@ -478,7 +544,7 @@ namespace RealisticEcgMod
             var closeTmp = CreateText(closeGo.transform, "X", "×", 15f, new Color(1f, 0.85f, 0.85f, 1f), TextAlignmentOptions.Center);
             StretchFull(closeTmp.rectTransform);
             closeTmp.raycastTarget = false;
-            closeGo.GetComponent<Button>().onClick.AddListener(CloseInternal);
+            closeGo.GetComponent<Button>().onClick.AddListener(UserCloseButtonClicked);
 
             // Per-curve visibility toggle bar
             var toggleBarGo = new GameObject("CurveToggleBar", typeof(RectTransform), typeof(Image), typeof(HorizontalLayoutGroup));
@@ -786,23 +852,34 @@ namespace RealisticEcgMod
 
         private void Update()
         {
-            if (!_isOpen) return;
-
-            // Auto-hide whenever WoundView closes, unchipped, or body dies
             bool woundOpen = (WoundView.view != null && WoundView.view.gameObject.activeInHierarchy) ||
                              (PlayerCamera.main != null && PlayerCamera.main.woundView != null && PlayerCamera.main.woundView.activeInHierarchy);
-            if (!woundOpen || WorldGeneration.unchipped)
+            Body? body = (WoundView.view != null && WoundView.view.body != null)
+                ? WoundView.view.body
+                : (_targetBody != null ? _targetBody : (PlayerCamera.main != null ? PlayerCamera.main.body : null));
+
+            bool canShow = woundOpen && !WorldGeneration.unchipped && body != null && body.alive;
+
+            if (!canShow)
             {
-                CloseInternal();
+                if (_isOpen)
+                    HideInternal();
                 return;
             }
 
-            Body? body = _targetBody != null ? _targetBody : (WoundView.view != null ? WoundView.view.body : (PlayerCamera.main != null ? PlayerCamera.main.body : null));
-            if (body == null || !body.alive)
+            // Re-open automatically on the exact frame WoundView opens if the saved toggle state is enabled
+            if (!_isOpen)
             {
-                CloseInternal();
-                return;
+                if (RealisticEcgPlugin.GetSavedMonitorOverlayEnabled())
+                {
+                    OpenInternal(body!, playSound: false);
+                }
+                else
+                {
+                    return;
+                }
             }
+
             _targetBody = body;
 
             RebuildChannelsIfNeeded();
@@ -816,7 +893,7 @@ namespace RealisticEcgMod
 
             foreach (var ch in _channels)
             {
-                UpdateChannelTrace(ch, body, dt, highSpeedMode);
+                UpdateChannelTrace(ch, body!, dt, highSpeedMode);
             }
         }
 

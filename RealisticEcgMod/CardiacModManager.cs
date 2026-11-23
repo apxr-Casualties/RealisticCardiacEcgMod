@@ -502,11 +502,13 @@ namespace RealisticEcgMod
             if (body == null || !body.alive || WorldGeneration.unchipped)
                 return;
 
-            // Only show while biochip medical panel (WoundView) is open; if triggered by hotkey while closed, open WoundView first if possible
+            // Only show while biochip medical panel (WoundView) is open; if triggered by hotkey while closed, open WoundView and show overlay
             if (PlayerCamera.main != null && PlayerCamera.main.woundView != null && !PlayerCamera.main.woundView.activeInHierarchy)
             {
                 if (!body.conscious) return;
                 PlayerCamera.main.woundView.SetActive(true);
+                PhysiologyMonitorOverlay.SetEnabledAndShow(body, true);
+                return;
             }
 
             PhysiologyMonitorOverlay.ToggleVisible(body);
